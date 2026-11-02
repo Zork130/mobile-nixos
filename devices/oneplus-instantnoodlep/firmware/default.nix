@@ -1,0 +1,67 @@
+{ lib
+, buildPackages
+, fetchFromGitHub
+, runCommand
+}:
+
+# Mirrors Nura's (postmarketOS) firmware-oneplus-instantnoodlep package.
+
+let
+  # Tools run during the build, so they are built for the build platform.
+  pil-squasher = buildPackages.stdenv.mkDerivation {
+    pname = "pil-squasher";
+    version = "unstable-2024";
+    src = fetchFromGitHub {
+      owner = "linux-msm";
+      repo = "pil-squasher";
+      rev = "3c9f8b8756ba6e4dbf9958570fd4c9aea7a70cf4";
+      hash = "sha256-MEW85w3RQhY3tPaWtH7OO22VKZrjwYUWBWnF3IF4YC0=";
+    };
+    makeFlags = [ "prefix=${placeholder "out"}" ];
+  };
+
+  qca-swiss-army-knife = fetchFromGitHub {
+    owner = "qca";
+    repo = "qca-swiss-army-knife";
+    rev = "6df4dae3e2f5e4c2903f3cafd40996fc1b3639ce";
+    hash = "sha256-FFoV58YVK7KGBw/JPFWcvGkJOONrfKCvACprYCzIKeg=";
+  };
+
+  baseFw = fetchFromGitHub {
+    owner = "pangwalla";
+    repo = "oneplus-instantnoodlep-firmware";
+    rev = "2dce2681689fcf615198c663555c5a7c7b3650ba";
+    hash = "sha256-JjKQGJXEkUe1uq/bDaTqFGyAelnicfefY3zRqo4HJmw=";
+  };
+in runCommand "oneplus-instantnoodlep-firmware" {
+  nativeBuildInputs = [ pil-squasher buildPackages.python3 ];
+  # We make no claims that it can be redistributed.
+  meta.license = lib.licenses.unfree;
+} ''
+  fw=$out/lib/firmware
+  mkdir -p $fw/postmarketos $fw/qca $fw/qcom/sdx55m $fw/ath11k/QCA6390/hw2.0
+  cp -r ${baseFw} src
+  chmod -R +w src
+  cd src
+
+  # The device tree asks for "postmarketos/<name>.mbn"
+  for f in adsp/adsp cdsp/cdsp ipa/ipa_fws ipa/ipa_uc slpi/slpi venus/venus; do
+    pil-squasher $fw/postmarketos/$(basename $f).mbn $f.mdt
+  done
+
+  cp bluetooth/* $fw/qca/
+  # a650_sqe.fw / a650_gmu.bin from the device are too old for current kernels
+  # ("SQE ucode is too old. Have version 93 need at least 95"); they aren't
+  # device-signed, so leave them to linux-firmware.
+  cp gpu/a650_zap.* $fw/qcom/
+  # Device-signed zap shader, where the device tree looks for it.
+  mkdir -p $fw/qcom/sm8250/OnePlus/instantnoodlep
+  pil-squasher $fw/qcom/sm8250/OnePlus/instantnoodlep/a650_zap.mbn gpu/a650_zap.mdt
+  cp modem/* $fw/qcom/sdx55m/
+
+  (
+    cd wlan
+    python3 ${qca-swiss-army-knife}/tools/scripts/ath11k/ath11k-bdencoder -c board-2.json
+    cp board-2.bin amss.bin m3.bin $fw/ath11k/QCA6390/hw2.0/
+  )
+''
