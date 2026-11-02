@@ -19,6 +19,16 @@ ifdef::env-github[]
 ⚠️ **Note**: Mobile NixOS is only expected to build successfully against the **unstable** branch of Nixpkgs.
 endif::[]
 
+[CAUTION]
+====
+*This is a fork, not the official Mobile NixOS repository.*
+The OnePlus 8 Pro (`oneplus-instantnoodlep`) support on this branch was
+written with the help of AI. Upstream Mobile NixOS has a no-AI policy for
+contributions, so none of this code can be submitted to the main repository.
+For everything else, use
+link:https://github.com/mobile-nixos/mobile-nixos[mobile-nixos/mobile-nixos].
+====
+
 == Documentation
 
  * link:https://mobile-nixos.github.io/[The Mobile NixOS website] hosts the rendered link:https://github.com/mobile-nixos/mobile-nixos/tree/development/doc[doc folder] for Mobile NixOS documentation.
