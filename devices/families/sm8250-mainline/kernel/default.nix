@@ -39,6 +39,8 @@ mobile-nixos.kernel-builder {
     ./patches/0011-ASoC-qcom-q6afe-port-calibration-records.patch
     # tfa987x: calibrated Re25 from the amps' MTP to TFADSP on each start.
     ./patches/0012-ASoC-tfa987x-send-calibrated-Re25-to-TFADSP.patch
+    # q6asm-dai: 24 bit PCM is S32_LE (S24_LE played 48 dB low).
+    ./patches/0013-ASoC-qcom-q6asm-dai-24-bit-PCM-is-S32_LE.patch
   ];
 
   # drm/msm generates its register headers with python at build time.

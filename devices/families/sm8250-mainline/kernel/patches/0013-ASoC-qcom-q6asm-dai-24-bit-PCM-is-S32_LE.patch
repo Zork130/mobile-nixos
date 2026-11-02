@@ -1,0 +1,64 @@
+From: Zork130 <12914881+Zork130@users.noreply.github.com>
+Subject: [PATCH] ASoC: qcom: q6asm-dai: 24 bit PCM is S32_LE, not S24_LE
+
+ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 with 24 bits per sample carries each
+sample in the most significant 24 bits of a 32 bit word, for playback and
+for recording alike. That is ALSA's S32_LE layout. The front ends offered
+S24_LE (24 bits in the least significant bits) and passed it on as such,
+so 24 bit playback reached the DSP 48 dB too low, and 24 bit capture came
+back shifted (heard as clipped noise with a few effective bits).
+
+Offer S32_LE instead of S24_LE and map it to 24 bits per sample.
+
+--- a/sound/soc/qcom/qdsp6/q6asm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6asm-dai.c
+@@ -90,7 +90,7 @@
+ 				SNDRV_PCM_INFO_INTERLEAVED |
+ 				SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME),
+ 	.formats =              (SNDRV_PCM_FMTBIT_S16_LE |
+-				SNDRV_PCM_FMTBIT_S24_LE),
++				SNDRV_PCM_FMTBIT_S32_LE),
+ 	.rates =                SNDRV_PCM_RATE_8000_48000,
+ 	.rate_min =             8000,
+ 	.rate_max =             48000,
+@@ -113,7 +113,7 @@
+ 				SNDRV_PCM_INFO_INTERLEAVED |
+ 				SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME),
+ 	.formats =              (SNDRV_PCM_FMTBIT_S16_LE |
+-				SNDRV_PCM_FMTBIT_S24_LE),
++				SNDRV_PCM_FMTBIT_S32_LE),
+ 	.rates =                SNDRV_PCM_RATE_8000_192000,
+ 	.rate_min =             8000,
+ 	.rate_max =             192000,
+@@ -139,7 +139,7 @@
+ 				  SNDRV_PCM_RATE_176400 |		\
+ 				  SNDRV_PCM_RATE_192000),		\
+ 			.formats = (SNDRV_PCM_FMTBIT_S16_LE |		\
+-					SNDRV_PCM_FMTBIT_S24_LE),	\
++					SNDRV_PCM_FMTBIT_S32_LE),	\
+ 			.channels_min = 1,				\
+ 			.channels_max = 8,				\
+ 			.rate_min =     8000,				\
+@@ -151,7 +151,7 @@
+ 				  SNDRV_PCM_RATE_12000 |		\
+ 				  SNDRV_PCM_RATE_24000),		\
+ 			.formats = (SNDRV_PCM_FMTBIT_S16_LE |		\
+-				    SNDRV_PCM_FMTBIT_S24_LE),		\
++				    SNDRV_PCM_FMTBIT_S32_LE),		\
+ 			.channels_min = 1,				\
+ 			.channels_max = 4,				\
+ 			.rate_min =     8000,				\
+@@ -506,7 +506,12 @@
+ 	case SNDRV_PCM_FORMAT_S16_LE:
+ 		prtd->bits_per_sample = 16;
+ 		break;
+-	case SNDRV_PCM_FORMAT_S24_LE:
++	/*
++	 * MULTI_CHANNEL_PCM_V2 at 24 bits carries the samples in the most
++	 * significant 24 bits of 32 bit words, both ways: that's S32_LE,
++	 * not S24_LE (which is LSB aligned, and came out 48 dB too low).
++	 */
++	case SNDRV_PCM_FORMAT_S32_LE:
+ 		prtd->bits_per_sample = 24;
+ 		break;
+ 	}
