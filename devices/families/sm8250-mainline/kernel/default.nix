@@ -41,6 +41,8 @@ mobile-nixos.kernel-builder {
     ./patches/0012-ASoC-tfa987x-send-calibrated-Re25-to-TFADSP.patch
     # q6asm-dai: 24 bit PCM is S32_LE (S24_LE played 48 dB low).
     ./patches/0013-ASoC-qcom-q6asm-dai-24-bit-PCM-is-S32_LE.patch
+    # q6afe-dai: a capture can't restart a running speaker feedback port.
+    ./patches/0014-ASoC-qcom-q6afe-dai-keep-a-running-feedback-port.patch
   ];
 
   # drm/msm generates its register headers with python at build time.

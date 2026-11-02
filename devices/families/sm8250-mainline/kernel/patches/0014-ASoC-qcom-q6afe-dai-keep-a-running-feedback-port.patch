@@ -1,0 +1,85 @@
+From: Zork130 <12914881+Zork130@users.noreply.github.com>
+Subject: [PATCH] ASoC: qcom: q6afe-dai: keep a running feedback port to its
+ RX port
+
+A feedback TX port started along with its RX port (qcom,feedback-dai) can
+also be the CPU DAI of a capture link, e.g. to record the amplifiers' V/I
+sense. Opening that capture restarted the port without the feedback path,
+which failed on the DSP and left the speaker protection without feedback
+for the rest of that playback.
+
+Mark ports started as feedback as owned by their RX port. A capture on an
+owned port joins it as it runs and leaves it running on close; only the
+RX port stops it. If the capture was there first, the RX port takes the
+port over when it starts.
+
+--- a/sound/soc/qcom/qdsp6/q6afe-dai.c
++++ b/sound/soc/qcom/qdsp6/q6afe-dai.c
+@@ -44,6 +44,8 @@
+ 	struct q6afe_port *port[AFE_PORT_MAX];
+ 	struct q6afe_port_config port_config[AFE_PORT_MAX];
+ 	bool is_port_started[AFE_PORT_MAX];
++	/* Started as an RX port's feedback; only that RX port stops it */
++	bool is_feedback_owned[AFE_PORT_MAX];
+ 	struct q6afe_dai_priv_data priv[AFE_PORT_MAX];
+ 	u32 *custom_topologies;
+ 	int custom_topologies_size;
+@@ -125,6 +127,16 @@
+ 		q6afe_port_set_topology(tx, dai_data->priv[tx_id].topology);
+ 	}
+ 
++	/*
++	 * Already running for a capture of its own: take it over, the
++	 * feedback path has to be set while it's stopped.
++	 */
++	if (dai_data->is_port_started[tx_id] && !dai_data->is_feedback_owned[tx_id]) {
++		if (q6afe_port_stop(dai_data->port[tx_id]) < 0)
++			dev_err(dev, "fail to close feedback port %d\n", tx_id);
++		dai_data->is_port_started[tx_id] = false;
++	}
++
+ 	ret = q6afe_port_set_feedback_path(dai_data->port[tx_id],
+ 					   dai_data->port[rx_id],
+ 					   rx_priv->feedback_chans,
+@@ -157,6 +169,7 @@
+ 		return;
+ 	}
+ 	dai_data->is_port_started[tx_id] = true;
++	dai_data->is_feedback_owned[tx_id] = true;
+ }
+ 
+ static void q6afe_dai_feedback_stop(struct device *dev,
+@@ -170,6 +183,7 @@
+ 	if (q6afe_port_stop(dai_data->port[tx_id]) < 0)
+ 		dev_err(dev, "fail to close feedback port %d\n", tx_id);
+ 	dai_data->is_port_started[tx_id] = false;
++	dai_data->is_feedback_owned[tx_id] = false;
+ }
+ 
+ static int q6slim_hw_params(struct snd_pcm_substream *substream,
+@@ -514,6 +528,10 @@
+ 	if (!dai_data->is_port_started[dai->id])
+ 		return;
+ 
++	/* A capture of a feedback port only joined it, see prepare */
++	if (dai_data->is_feedback_owned[dai->id])
++		return;
++
+ 	if (dai_data->priv[dai->id].feedback_dai >= 0)
+ 		q6afe_dai_feedback_stop(dai->dev, dai_data, dai->id);
+ 
+@@ -531,6 +549,14 @@
+ 	struct q6afe_dai_data *dai_data = dev_get_drvdata(dai->dev);
+ 	int rc;
+ 
++	/*
++	 * Capturing a port that runs as an RX port's feedback (e.g. to
++	 * look at the V/I sense): join it as it is. Restarting it would
++	 * drop the feedback path the speaker protection depends on.
++	 */
++	if (dai_data->is_feedback_owned[dai->id])
++		return 0;
++
+ 	if (dai_data->is_port_started[dai->id]) {
+ 		if (dai_data->priv[dai->id].feedback_dai >= 0)
+ 			q6afe_dai_feedback_stop(dai->dev, dai_data, dai->id);
