@@ -60,9 +60,21 @@
     ];
   };
 
-  # The TFA9874 speaker protection DSP isn't used on mainline, and with it goes
-  # the loudness Android gets from its compressor. Stand in with makeup gain
-  # and a lookahead limiter, as the default "Speaker" output.
+  # Same on playback: with S24_LE on the front end the ADSP gets the samples
+  # some 48 dB too low (clean, just very quiet; the amps flag low amplitude
+  # and never boost). S16_LE plays at full level, as loud as Android.
+  services.pipewire.wireplumber.extraConfig."52-oneplus8pro-speaker-s16" = {
+    "monitor.alsa.rules" = [
+      {
+        matches = [ { "node.name" = "alsa_output.platform-sound.HiFi__Speaker__sink"; } ];
+        actions.update-props."audio.format" = "S16LE";
+      }
+    ];
+  };
+
+  # Makeup gain and a lookahead limiter as the default "Speaker" output. Added
+  # before the S16 fix above, when the speakers were quiet for that reason;
+  # NXP TFADSP on the ADSP now does the speaker protection, as on Android.
   services.pipewire.extraConfig.pipewire."60-oneplus8pro-speaker-loudness" = {
     "context.modules" = [
       {
