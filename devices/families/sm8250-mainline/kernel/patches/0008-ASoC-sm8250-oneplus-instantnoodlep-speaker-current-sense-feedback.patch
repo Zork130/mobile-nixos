@@ -1,0 +1,132 @@
+From: Zork130 <12914881+Zork130@users.noreply.github.com>
+Subject: [PATCH] ASoC/arm64: OnePlus 8 Pro: speaker current sense feedback
+ on TERTIARY_MI2S_TX
+
+The NXP speaker protection on the ADSP needs the amplifiers' current sense.
+As on the vendor kernel, both TFA9874s put it on their shared DATAO line in
+their own slot, which is the tertiary MI2S data0 input.
+
+- tfa987x: enable current sense out (TDMCSE) in the amplifier's slot, the
+  vendor TDM source mapping, and a capture stream for it.
+- sm8250: TERTIARY_MI2S_TX gets the same clock and format as the RX side.
+- dts: "Speaker Feedback" capture link on TERTIARY_MI2S_TX, data0 as input.
+
+diff -ru a/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts b/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts
+--- a/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts	2026-11-02 15:14:39.797192422 +0000
++++ b/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts	2026-11-02 15:30:23.971021009 +0000
+@@ -1415,6 +1415,23 @@
+ 		};
+ 	};
+ 
++	/* Amplifier current sense, for the speaker protection on the ADSP */
++	speaker-fb-dai-link {
++		link-name = "Speaker Feedback";
++
++		codec {
++			sound-dai = <&top_spkr>, <&bottom_spkr>;
++		};
++
++		cpu {
++			sound-dai = <&q6afedai TERTIARY_MI2S_TX>;
++		};
++
++		platform {
++			sound-dai = <&q6routing>;
++		};
++	};
++
+ 	usb-dai-link {
+ 		link-name = "USB Playback";
+ 
+@@ -1501,6 +1518,15 @@
+ };
+ 
+ &tert_mi2s_active {
++	/* DATAO of both amplifiers: sense data in, not out */
++	data0-pins {
++		/delete-property/ output-high;
++		/delete-property/ bias-disable;
++		drive-strength = <2>;
++		bias-pull-down;
++		input-enable;
++	};
++
+ 	data1-pins {
+ 		pins = "gpio137";
+ 		function = "mi2s2_data1";
+diff -ru a/sound/soc/codecs/tfa987x.c b/sound/soc/codecs/tfa987x.c
+--- a/sound/soc/codecs/tfa987x.c	2026-11-02 15:15:01.330073187 +0000
++++ b/sound/soc/codecs/tfa987x.c	2026-11-02 15:30:23.970020968 +0000
+@@ -70,6 +70,9 @@
+ #define TFA987X_MODE1_DET1_LPM1MODE_MSK	GENMASK(15, 14)
+ #define TFA987X_MODE1_DETECTOR2		0x65
+ #define TFA987X_TDM_SRC			0x68
++#define TFA987X_TDM_SRC_MAP_MSK		GENMASK(2, 0)
++#define TFA987X_TDM_SRC_AS_MSK		GENMASK(4, 3)
++#define TFA987X_TDM_SRC_BS_MSK		GENMASK(6, 5)
+ #define TFA987X_CURSENSE_COMP		0x6f
+ #define TFA987X_DCDC_CTRL0		0x70
+ #define TFA9872_DCDC_CTRL0_DCVOS_MSK	GENMASK(2,  0)
+@@ -138,6 +141,16 @@
+ 		.channels_min	= 1,
+ 		.channels_max	= 2,
+ 	},
++	/* Current sense, see TDMCSE */
++	.capture = {
++		.stream_name	= "HiFi Capture",
++		.formats	= SNDRV_PCM_FMTBIT_S16_LE,
++		.rates		= SNDRV_PCM_RATE_48000,
++		.rate_min	= 48000,
++		.rate_max	= 48000,
++		.channels_min	= 1,
++		.channels_max	= 2,
++	},
+ 	.ops = &tfa987x_dai_ops,
+ };
+ 
+@@ -317,16 +330,30 @@
+ 				 TFA987X_TDM_CFG2_SWIDTH_MSK,
+ 				 FIELD_PREP(TFA987X_TDM_CFG2_SWIDTH_MSK, 15));
+ 
+-	/* No current/voltage sense over TDM */
++	/*
++	 * Current sense out on DATAO, in this amplifier's slot, as feedback
++	 * for the speaker protection on the DSP. Source mapping as in the
++	 * vendor tfa98xx.cnt.
++	 */
+ 	regmap_update_bits(rmap, TFA987X_TDM_CFG3,
+ 				 TFA987X_TDM_CFG3_SPKE_MSK |
+ 				 TFA987X_TDM_CFG3_DCE_MSK |
+ 				 TFA987X_TDM_CFG3_CSE_MSK |
+ 				 TFA987X_TDM_CFG3_VSE_MSK,
+-				 TFA987X_TDM_CFG3_SPKE_MSK);
++				 TFA987X_TDM_CFG3_SPKE_MSK |
++				 TFA987X_TDM_CFG3_CSE_MSK);
+ 	regmap_update_bits(rmap, TFA987X_TDM_CFG6,
+-				 TFA987X_TDM_CFG6_SPKS_MSK,
+-				 FIELD_PREP(TFA987X_TDM_CFG6_SPKS_MSK, channel_index));
++				 TFA987X_TDM_CFG6_SPKS_MSK |
++				 TFA987X_TDM_CFG6_CSS_MSK,
++				 FIELD_PREP(TFA987X_TDM_CFG6_SPKS_MSK, channel_index) |
++				 FIELD_PREP(TFA987X_TDM_CFG6_CSS_MSK, channel_index));
++	regmap_update_bits(rmap, TFA987X_TDM_SRC,
++				 TFA987X_TDM_SRC_MAP_MSK |
++				 TFA987X_TDM_SRC_AS_MSK |
++				 TFA987X_TDM_SRC_BS_MSK,
++				 FIELD_PREP(TFA987X_TDM_SRC_MAP_MSK, 3) |
++				 FIELD_PREP(TFA987X_TDM_SRC_AS_MSK, 1) |
++				 FIELD_PREP(TFA987X_TDM_SRC_BS_MSK, 2));
+ 
+ 	if ((rev & 0xff) == 0x72)
+ 		regmap_update_bits(rmap, TFA987X_MODE1_DET1,
+diff -ru a/sound/soc/qcom/sm8250.c b/sound/soc/qcom/sm8250.c
+--- a/sound/soc/qcom/sm8250.c	2026-11-02 15:15:01.326073024 +0000
++++ b/sound/soc/qcom/sm8250.c	2026-11-02 15:15:01.339073556 +0000
+@@ -152,6 +152,7 @@
+ 		snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
+ 		break;
+ 	case TERTIARY_MI2S_RX:
++	case TERTIARY_MI2S_TX:
+ 		codec_dai_fmt |= SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S;
+ 		snd_soc_dai_set_sysclk(cpu_dai,
+ 			Q6AFE_LPASS_CLK_ID_TER_MI2S_IBIT,

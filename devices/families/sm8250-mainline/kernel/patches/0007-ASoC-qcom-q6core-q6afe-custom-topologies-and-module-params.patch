@@ -1,0 +1,578 @@
+From: Zork130 <12914881+Zork130@users.noreply.github.com>
+Subject: [PATCH] ASoC: qcom: q6core/q6afe: custom topologies and raw module
+ parameter access
+
+Vendor speaker protection (NXP TFADSP on the OnePlus 8 Pro) runs as a module
+in a custom AFE topology on the ADSP. Add what is needed to bring it up:
+
+- q6core_register_topologies(): register custom topologies (as stored in
+  the ACDB) in-band with AVCS_CMD_REGISTER_TOPOLOGIES.
+- q6afe_port_set_topology(): topology sent before the port config on start.
+- q6afe_port_{set,get}_module_param(): parameter access for any module.
+- debugfs q6afe/cmd for poking all of the above from userspace.
+
+diff -ru a/sound/soc/qcom/qdsp6/q6afe.c b/sound/soc/qcom/qdsp6/q6afe.c
+--- a/sound/soc/qcom/qdsp6/q6afe.c	2026-11-02 14:59:53.995649980 +0000
++++ b/sound/soc/qcom/qdsp6/q6afe.c	2026-11-02 15:01:37.521939542 +0000
+@@ -15,6 +15,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/spinlock.h>
+ #include <linux/delay.h>
++#include <linux/debugfs.h>
+ #include <linux/soc/qcom/apr.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dai.h>
+@@ -30,6 +31,9 @@
+ #define AFE_PORT_CMD_SET_PARAM_V2	0x000100EF
+ #define AFE_SVC_CMD_SET_PARAM		0x000100f3
+ #define AFE_PORT_CMDRSP_GET_PARAM_V2	0x00010106
++#define AFE_PORT_CMD_GET_PARAM_V2	0x000100F0
++#define AFE_PARAM_ID_SET_TOPOLOGY	0x0001025A
++#define AFE_API_VERSION_TOPOLOGY_V1	0x1
+ #define AFE_PARAM_ID_HDMI_CONFIG	0x00010210
+ #define AFE_MODULE_AUDIO_DEV_INTERFACE	0x0001020C
+ #define AFE_MODULE_TDM			0x0001028A
+@@ -382,6 +386,10 @@
+ 	wait_queue_head_t wait;
+ 	struct list_head port_list;
+ 	spinlock_t port_list_lock;
++	struct dentry *debugfs;
++	struct mutex dbg_lock;
++	char dbg_out[2048];
++	size_t dbg_len;
+ };
+ 
+ struct afe_port_cmd_device_start {
+@@ -417,6 +425,28 @@
+ 	u32 mem_map_handle;
+ } __packed;
+ 
++struct afe_port_cmd_get_param_v2 {
++	u16 port_id;
++	u16 payload_size;
++	u32 payload_address_lsw;
++	u32 payload_address_msw;
++	u32 mem_map_handle;
++	u32 module_id;
++	u32 param_id;
++	struct afe_port_param_data_v2 param_hdr;
++} __packed;
++
++struct afe_port_cmdrsp_get_param_v2 {
++	u32 status;
++	struct afe_port_param_data_v2 param_hdr;
++	u8 param_data[];
++} __packed;
++
++struct afe_param_id_set_topology_cfg {
++	u32 minor_version;
++	u32 topology_id;
++} __packed;
++
+ struct afe_param_id_hdmi_multi_chan_audio_cfg {
+ 	u32 hdmi_cfg_minor_version;
+ 	u16 datatype;
+@@ -643,6 +673,9 @@
+ 	struct q6afe *afe;
+ 	struct kref refcount;
+ 	struct list_head node;
++	u32 topology;
++	void *get_buf;
++	size_t get_size;
+ };
+ 
+ struct afe_cmd_remote_lpass_core_hw_vote_request {
+@@ -994,12 +1027,41 @@
+ 				wake_up(&afe->wait);
+ 			}
+ 			break;
++		case AFE_PORT_CMD_GET_PARAM_V2:
++			/* A failed get comes back as a basic response. */
++			port = q6afe_find_port(afe, hdr->token);
++			if (port) {
++				port->result = *res;
++				port->result.opcode = AFE_PORT_CMDRSP_GET_PARAM_V2;
++				wake_up(&port->wait);
++				kref_put(&port->refcount, q6afe_port_free);
++			}
++			break;
+ 		default:
+ 			dev_err(afe->dev, "Unknown cmd 0x%x\n",	res->opcode);
+ 			break;
+ 		}
+ 	}
+ 		break;
++	case AFE_PORT_CMDRSP_GET_PARAM_V2: {
++		const struct afe_port_cmdrsp_get_param_v2 *rsp = data->payload;
++		size_t len;
++
++		port = q6afe_find_port(afe, hdr->token);
++		if (!port)
++			break;
++		if (data->payload_size >= sizeof(*rsp) && port->get_buf) {
++			len = min_t(size_t, data->payload_size - sizeof(*rsp),
++				  port->get_size);
++			memcpy(port->get_buf, rsp->param_data, len);
++		}
++		port->result.opcode = hdr->opcode;
++		port->result.status = data->payload_size >= sizeof(u32) ?
++				      rsp->status : ADSP_EFAILED;
++		wake_up(&port->wait);
++		kref_put(&port->refcount, q6afe_port_free);
++		break;
++	}
+ 	case AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST:
+ 		afe->result.opcode = hdr->opcode;
+ 		afe->result.status = res->status;
+@@ -1170,6 +1232,103 @@
+ 	return ret;
+ }
+ 
++static int q6afe_port_get_param_v2(struct q6afe_port *port, u32 module_id,
++				   u32 param_id, void *data, size_t size)
++{
++	struct afe_port_cmd_get_param_v2 *param;
++	struct q6afe *afe = port->afe;
++	struct apr_pkt *pkt;
++	int ret, pkt_size = APR_HDR_SIZE + sizeof(*param);
++
++	if (size > U16_MAX - sizeof(param->param_hdr))
++		return -EINVAL;
++
++	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++
++	pkt = p;
++	param = p + APR_HDR_SIZE;
++
++	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					   APR_HDR_LEN(APR_HDR_SIZE),
++					   APR_PKT_VER);
++	pkt->hdr.pkt_size = pkt_size;
++	pkt->hdr.token = port->token;
++	pkt->hdr.opcode = AFE_PORT_CMD_GET_PARAM_V2;
++
++	param->port_id = port->id;
++	param->payload_size = sizeof(param->param_hdr) + size;
++	param->module_id = module_id;
++	param->param_id = param_id;
++	param->param_hdr.module_id = module_id;
++	param->param_hdr.param_id = param_id;
++	param->param_hdr.param_size = size;
++
++	port->get_buf = data;
++	port->get_size = size;
++	ret = afe_apr_send_pkt(afe, pkt, port, AFE_PORT_CMDRSP_GET_PARAM_V2);
++	port->get_buf = NULL;
++	port->get_size = 0;
++	if (ret)
++		dev_err(afe->dev, "AFE get param 0x%x/0x%x on port 0x%x failed %d\n",
++			module_id, param_id, port->id, ret);
++
++	return ret;
++}
++
++/**
++ * q6afe_port_set_module_param() - Set a parameter of a module on a port
++ *
++ * @port: AFE port
++ * @module_id: module in the port's topology
++ * @param_id: parameter of that module
++ * @data: parameter payload
++ * @size: payload size in bytes
++ *
++ * Return: zero on success, negative error code otherwise.
++ */
++int q6afe_port_set_module_param(struct q6afe_port *port, u32 module_id,
++				u32 param_id, const void *data, size_t size)
++{
++	return q6afe_port_set_param_v2(port, (void *)data, param_id,
++				       module_id, size);
++}
++EXPORT_SYMBOL_GPL(q6afe_port_set_module_param);
++
++/**
++ * q6afe_port_get_module_param() - Read a parameter of a module on a port
++ *
++ * @port: AFE port
++ * @module_id: module in the port's topology
++ * @param_id: parameter of that module
++ * @data: buffer for the parameter payload
++ * @size: size of @data in bytes
++ *
++ * Return: zero on success, negative error code otherwise.
++ */
++int q6afe_port_get_module_param(struct q6afe_port *port, u32 module_id,
++				u32 param_id, void *data, size_t size)
++{
++	return q6afe_port_get_param_v2(port, module_id, param_id, data, size);
++}
++EXPORT_SYMBOL_GPL(q6afe_port_get_module_param);
++
++/**
++ * q6afe_port_set_topology() - Select the topology a port starts with
++ *
++ * @port: AFE port
++ * @topology_id: topology id, or 0 for the DSP default. Custom topologies
++ *               must be registered first, see q6core_register_topologies().
++ *
++ * Takes effect on the next q6afe_port_start().
++ */
++void q6afe_port_set_topology(struct q6afe_port *port, u32 topology_id)
++{
++	port->topology = topology_id;
++}
++EXPORT_SYMBOL_GPL(q6afe_port_set_topology);
++
+ static int q6afe_port_set_lpass_clock(struct q6afe_port *port,
+ 				 struct afe_clk_cfg *cfg)
+ {
+@@ -1673,6 +1832,21 @@
+ 	struct apr_pkt *pkt;
+ 	int pkt_size;
+ 
++	if (port->topology) {
++		struct afe_param_id_set_topology_cfg topo = {
++			.minor_version = AFE_API_VERSION_TOPOLOGY_V1,
++			.topology_id = port->topology,
++		};
++
++		/* Not fatal: the port still works with the default topology. */
++		if (q6afe_port_set_param_v2(port, &topo,
++					    AFE_PARAM_ID_SET_TOPOLOGY,
++					    AFE_MODULE_AUDIO_DEV_INTERFACE,
++					    sizeof(topo)))
++			dev_err(afe->dev, "port 0x%x: topology 0x%x rejected\n",
++				port_id, port->topology);
++	}
++
+ 	ret  = q6afe_port_set_param_v2(port, &port->port_cfg, param_id,
+ 				       AFE_MODULE_AUDIO_DEV_INTERFACE,
+ 				       sizeof(port->port_cfg));
+@@ -1904,6 +2078,182 @@
+ }
+ EXPORT_SYMBOL(q6afe_vote_lpass_core_hw);
+ 
++#ifdef CONFIG_DEBUG_FS
++/*
++ * Raw access to DSP modules, for bringing up vendor modules such as speaker
++ * protection. Numbers are parsed with base 0, payloads are u32 words.
++ *
++ *   regtopo <word>...                      register custom topologies
++ *   topo <port> <topology>                 topology for the port's next start
++ *   set <port> <module> <param> <word>...  set a module parameter
++ *   get <port> <module> <param> <bytes>    get a module parameter
++ *
++ * <port> is the DSP port id (e.g. 0x1004 for TERTIARY_MI2S_RX). Reading
++ * the file returns the result of the last command.
++ */
++#define Q6AFE_DBG_MAX_WORDS 256
++
++static struct q6afe_port *q6afe_find_port_by_id(struct q6afe *afe, u32 id)
++{
++	struct q6afe_port *p;
++
++	guard(spinlock_irqsave)(&afe->port_list_lock);
++	list_for_each_entry(p, &afe->port_list, node)
++		if (p->id == id) {
++			kref_get(&p->refcount);
++			return p;
++		}
++
++	return NULL;
++}
++
++static void q6afe_dbg_printf(struct q6afe *afe, const char *fmt, ...)
++{
++	va_list args;
++
++	va_start(args, fmt);
++	afe->dbg_len += vscnprintf(afe->dbg_out + afe->dbg_len,
++				   sizeof(afe->dbg_out) - afe->dbg_len,
++				   fmt, args);
++	va_end(args);
++}
++
++static int q6afe_dbg_run(struct q6afe *afe, char *line)
++{
++	struct q6afe_port *port = NULL;
++	char *cmd, *tok;
++	u32 *w;
++	int n = 0, ret, i;
++
++	w = kcalloc(Q6AFE_DBG_MAX_WORDS, sizeof(*w), GFP_KERNEL);
++	if (!w)
++		return -ENOMEM;
++
++	cmd = strsep(&line, " \t\n");
++	while ((tok = strsep(&line, " \t\n"))) {
++		if (!*tok)
++			continue;
++		if (n == Q6AFE_DBG_MAX_WORDS) {
++			ret = -E2BIG;
++			goto out;
++		}
++		ret = kstrtou32(tok, 0, &w[n++]);
++		if (ret)
++			goto out;
++	}
++
++	if (!strcmp(cmd, "regtopo")) {
++		ret = q6core_register_topologies(w, n * sizeof(*w));
++		goto out;
++	}
++
++	ret = -EINVAL;
++	if (n < 2)
++		goto out;
++	port = q6afe_find_port_by_id(afe, w[0]);
++	if (!port) {
++		ret = -ENODEV;
++		goto out;
++	}
++
++	if (!strcmp(cmd, "topo") && n == 2) {
++		q6afe_port_set_topology(port, w[1]);
++		ret = 0;
++	} else if (!strcmp(cmd, "set") && n >= 3) {
++		ret = q6afe_port_set_module_param(port, w[1], w[2], &w[3],
++						  (n - 3) * sizeof(*w));
++	} else if (!strcmp(cmd, "get") && n == 4) {
++		size_t size = min_t(size_t, round_up(w[3], 4),
++				    Q6AFE_DBG_MAX_WORDS * sizeof(*w));
++		u32 *buf = kzalloc(size, GFP_KERNEL);
++
++		if (!buf) {
++			ret = -ENOMEM;
++			goto out;
++		}
++		ret = q6afe_port_get_module_param(port, w[1], w[2], buf, size);
++		q6afe_dbg_printf(afe, "%s %d dsp_status 0x%x\n", cmd, ret,
++				 port->result.status);
++		for (i = 0; !ret && i < size / 4; i++)
++			q6afe_dbg_printf(afe, "%08x%c", buf[i],
++					 (i % 8 == 7) ? '\n' : ' ');
++		q6afe_dbg_printf(afe, "\n");
++		kfree(buf);
++		goto out_put;
++	}
++	q6afe_dbg_printf(afe, "%s %d dsp_status 0x%x\n", cmd, ret,
++			 port->result.status);
++out_put:
++	q6afe_port_put(port);
++	kfree(w);
++	return ret;
++out:
++	q6afe_dbg_printf(afe, "%s %d\n", cmd ? cmd : "", ret);
++	kfree(w);
++	return ret;
++}
++
++static ssize_t q6afe_dbg_write(struct file *file, const char __user *ubuf,
++			       size_t count, loff_t *ppos)
++{
++	struct q6afe *afe = file->private_data;
++	char *line;
++
++	if (count > 4096)
++		return -E2BIG;
++
++	line = memdup_user_nul(ubuf, count);
++	if (IS_ERR(line))
++		return PTR_ERR(line);
++
++	mutex_lock(&afe->dbg_lock);
++	afe->dbg_len = 0;
++	q6afe_dbg_run(afe, line);
++	mutex_unlock(&afe->dbg_lock);
++	kfree(line);
++
++	return count;
++}
++
++static ssize_t q6afe_dbg_read(struct file *file, char __user *ubuf,
++			      size_t count, loff_t *ppos)
++{
++	struct q6afe *afe = file->private_data;
++	ssize_t ret;
++
++	mutex_lock(&afe->dbg_lock);
++	ret = simple_read_from_buffer(ubuf, count, ppos, afe->dbg_out,
++				      afe->dbg_len);
++	mutex_unlock(&afe->dbg_lock);
++
++	return ret;
++}
++
++static const struct file_operations q6afe_dbg_fops = {
++	.open = simple_open,
++	.read = q6afe_dbg_read,
++	.write = q6afe_dbg_write,
++	.llseek = default_llseek,
++};
++
++static void q6afe_debugfs_remove(void *data)
++{
++	struct q6afe *afe = data;
++
++	debugfs_remove_recursive(afe->debugfs);
++}
++
++static void q6afe_debugfs_init(struct q6afe *afe)
++{
++	mutex_init(&afe->dbg_lock);
++	afe->debugfs = debugfs_create_dir("q6afe", NULL);
++	debugfs_create_file("cmd", 0600, afe->debugfs, afe, &q6afe_dbg_fops);
++	devm_add_action_or_reset(afe->dev, q6afe_debugfs_remove, afe);
++}
++#else
++static void q6afe_debugfs_init(struct q6afe *afe) {}
++#endif
++
+ static int q6afe_probe(struct apr_device *adev)
+ {
+ 	struct q6afe *afe;
+@@ -1922,6 +2272,7 @@
+ 	spin_lock_init(&afe->port_list_lock);
+ 
+ 	dev_set_drvdata(dev, afe);
++	q6afe_debugfs_init(afe);
+ 
+ 	return devm_of_platform_populate(dev);
+ }
+diff -ru a/sound/soc/qcom/qdsp6/q6afe.h b/sound/soc/qcom/qdsp6/q6afe.h
+--- a/sound/soc/qcom/qdsp6/q6afe.h	2026-11-02 15:01:20.808247065 +0000
++++ b/sound/soc/qcom/qdsp6/q6afe.h	2026-11-02 15:01:27.550526412 +0000
+@@ -248,6 +248,11 @@
+ 
+ struct q6afe_port *q6afe_port_get_from_id(struct device *dev, int id);
+ int q6afe_port_start(struct q6afe_port *port);
++int q6afe_port_set_module_param(struct q6afe_port *port, u32 module_id,
++				u32 param_id, const void *data, size_t size);
++int q6afe_port_get_module_param(struct q6afe_port *port, u32 module_id,
++				u32 param_id, void *data, size_t size);
++void q6afe_port_set_topology(struct q6afe_port *port, u32 topology_id);
+ int q6afe_port_stop(struct q6afe_port *port);
+ void q6afe_port_put(struct q6afe_port *port);
+ int q6afe_get_port_id(int index);
+diff -ru a/sound/soc/qcom/qdsp6/q6core.c b/sound/soc/qcom/qdsp6/q6core.c
+--- a/sound/soc/qcom/qdsp6/q6core.c	2026-11-02 14:59:53.995649980 +0000
++++ b/sound/soc/qcom/qdsp6/q6core.c	2026-11-02 15:00:19.692714793 +0000
+@@ -22,6 +22,15 @@
+ #define AVCS_GET_VERSIONS_RSP   0x00012906
+ #define AVCS_CMD_GET_FWK_VERSION	0x001292c
+ #define AVCS_CMDRSP_GET_FWK_VERSION	0x001292d
++#define AVCS_CMD_REGISTER_TOPOLOGIES	0x00012923
++#define Q6_REG_TOPO_TIMEOUT_MS		1000
++
++struct avcs_cmd_register_topologies {
++	uint32_t payload_addr_lsw;
++	uint32_t payload_addr_msw;
++	uint32_t mem_map_handle;
++	uint32_t payload_size;
++} __packed;
+ 
+ struct avcs_svc_info {
+ 	uint32_t service_id;
+@@ -63,6 +72,7 @@
+ 	bool get_state_supported;
+ 	bool get_version_supported;
+ 	bool is_version_requested;
++	uint32_t reg_topo_status;
+ };
+ 
+ static struct q6core *g_core;
+@@ -93,6 +103,10 @@
+ 				core->get_state_supported = false;
+ 			core->resp_received = true;
+ 			break;
++		case AVCS_CMD_REGISTER_TOPOLOGIES:
++			core->reg_topo_status = result->status;
++			core->resp_received = true;
++			break;
+ 		}
+ 		break;
+ 	}
+@@ -325,6 +339,71 @@
+ }
+ EXPORT_SYMBOL_GPL(q6core_is_adsp_ready);
+ 
++/**
++ * q6core_register_topologies() - Register custom topologies with the DSP
++ *
++ * @buf: topology buffer, as stored in the ACDB: a u32 topology count
++ *       followed by the topology definitions
++ * @size: size of @buf in bytes
++ *
++ * The buffer is passed in-band (NULL memory map handle).
++ *
++ * Return: zero on success, negative error code otherwise.
++ */
++int q6core_register_topologies(const void *buf, size_t size)
++{
++	struct avcs_cmd_register_topologies *reg;
++	struct apr_pkt *pkt;
++	int pkt_size, rc;
++
++	if (!g_core)
++		return -ENODEV;
++
++	pkt_size = APR_HDR_SIZE + sizeof(*reg) + size;
++	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++
++	pkt = p;
++	reg = p + APR_HDR_SIZE;
++	memcpy(p + APR_HDR_SIZE + sizeof(*reg), buf, size);
++
++	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++				      APR_HDR_LEN(APR_HDR_SIZE), APR_PKT_VER);
++	pkt->hdr.pkt_size = pkt_size;
++	pkt->hdr.opcode = AVCS_CMD_REGISTER_TOPOLOGIES;
++	reg->payload_size = size;
++
++	mutex_lock(&g_core->lock);
++	g_core->resp_received = false;
++	g_core->reg_topo_status = 0;
++
++	rc = apr_send_pkt(g_core->adev, pkt);
++	if (rc < 0)
++		goto out;
++
++	rc = wait_event_timeout(g_core->wait, g_core->resp_received,
++				msecs_to_jiffies(Q6_REG_TOPO_TIMEOUT_MS));
++	if (!rc) {
++		rc = -ETIMEDOUT;
++		goto out;
++	}
++	g_core->resp_received = false;
++
++	if (g_core->reg_topo_status) {
++		dev_err(&g_core->adev->dev,
++			"register topologies failed: DSP error 0x%x\n",
++			g_core->reg_topo_status);
++		rc = -EIO;
++	} else {
++		rc = 0;
++	}
++out:
++	mutex_unlock(&g_core->lock);
++	return rc;
++}
++EXPORT_SYMBOL_GPL(q6core_register_topologies);
++
+ static int q6core_probe(struct apr_device *adev)
+ {
+ 	g_core = kzalloc_obj(*g_core);
+diff -ru a/sound/soc/qcom/qdsp6/q6core.h b/sound/soc/qcom/qdsp6/q6core.h
+--- a/sound/soc/qcom/qdsp6/q6core.h	2026-11-02 14:59:53.995649980 +0000
++++ b/sound/soc/qcom/qdsp6/q6core.h	2026-11-02 15:00:10.211321917 +0000
+@@ -11,5 +11,6 @@
+ 
+ bool q6core_is_adsp_ready(void);
+ int q6core_get_svc_api_info(int svc_id, struct q6core_svc_api_info *ainfo);
++int q6core_register_topologies(const void *buf, size_t size);
+ 
+ #endif /* __Q6CORE_H__ */

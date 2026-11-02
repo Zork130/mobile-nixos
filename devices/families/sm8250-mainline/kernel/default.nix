@@ -27,6 +27,12 @@ mobile-nixos.kernel-builder {
     ./patches/0005-arm64-dts-qcom-sm8250-oneplus-instantnoodlep-Enable-.patch
     # Speaker amplifiers: vendor TFA9874 init, DC-DC setup fixes, boost config.
     ./patches/0006-ASoC-tfa987x-apply-TFA9874-init-and-enable-the-boost.patch
+    # q6core/q6afe: custom topologies + module params, for TFADSP speaker protection.
+    ./patches/0007-ASoC-qcom-q6core-q6afe-custom-topologies-and-module-params.patch
+    # Speaker current sense feedback on TERTIARY_MI2S_TX (amps, machine driver, DT).
+    ./patches/0008-ASoC-sm8250-oneplus-instantnoodlep-speaker-current-sense-feedback.patch
+    # Tertiary MI2S (speakers) at 2 x 32 bit slots, for current sense resolution.
+    ./patches/0009-ASoC-sm8250-tfa987x-32-bit-slots-on-tertiary-MI2S.patch
   ];
 
   # drm/msm generates its register headers with python at build time.
