@@ -60,6 +60,50 @@
     ];
   };
 
+  # The TFA9874 speaker protection DSP isn't used on mainline, and with it goes
+  # the loudness Android gets from its compressor. Stand in with makeup gain
+  # and a lookahead limiter, as the default "Speaker" output.
+  services.pipewire.extraConfig.pipewire."60-oneplus8pro-speaker-loudness" = {
+    "context.modules" = [
+      {
+        name = "libpipewire-module-filter-chain";
+        args = {
+          "node.description" = "Speaker";
+          "media.name" = "Speaker loudness";
+          "filter.graph" = {
+            nodes = [
+              {
+                type = "ladspa";
+                name = "limiter";
+                plugin = "${pkgs.ladspaPlugins}/lib/ladspa/fast_lookahead_limiter_1913.so";
+                label = "fastLookaheadLimiter";
+                control = {
+                  "Input gain (dB)" = 8;
+                  "Limit (dB)" = -1;
+                  "Release time (s)" = 0.1;
+                };
+              }
+            ];
+            inputs = [ "limiter:Input 1" "limiter:Input 2" ];
+            outputs = [ "limiter:Output 1" "limiter:Output 2" ];
+          };
+          "audio.channels" = 2;
+          "audio.position" = [ "FL" "FR" ];
+          "capture.props" = {
+            "node.name" = "effect_input.speaker_loudness";
+            "media.class" = "Audio/Sink";
+            "priority.session" = 2000;
+          };
+          "playback.props" = {
+            "node.name" = "effect_output.speaker_loudness";
+            "node.passive" = true;
+            "target.object" = "alsa_output.platform-sound.HiFi__Speaker__sink";
+          };
+        };
+      }
+    ];
+  };
+
   mobile.system.android.device_name = "OnePlus8Pro";
   # Launched with Android 10: A/B, but with discrete recovery_a/recovery_b
   # partitions, and the bootloader never passes skip_initramfs.

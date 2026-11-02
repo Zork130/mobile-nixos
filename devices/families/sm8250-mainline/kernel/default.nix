@@ -25,6 +25,8 @@ mobile-nixos.kernel-builder {
     ./patches/0003-arm64-dts-qcom-sm8250-oneplus-instantnoodlep-Enable-.patch
     ./patches/0004-arm64-dts-qcom-sm8250-oneplus-instantnoodlep-Enable-.patch
     ./patches/0005-arm64-dts-qcom-sm8250-oneplus-instantnoodlep-Enable-.patch
+    # Speaker amplifiers: vendor TFA9874 init, DC-DC setup fixes, boost config.
+    ./patches/0006-ASoC-tfa987x-apply-TFA9874-init-and-enable-the-boost.patch
   ];
 
   # drm/msm generates its register headers with python at build time.

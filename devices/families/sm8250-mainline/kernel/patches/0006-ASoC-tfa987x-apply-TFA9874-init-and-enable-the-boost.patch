@@ -1,0 +1,147 @@
+From: Zork130 <12914881+Zork130@users.noreply.github.com>
+Subject: [PATCH] ASoC: codecs: tfa987x: apply TFA9874 N1C init, fix DC-DC setup;
+ arm64: dts: qcom: sm8250-oneplus-instantnoodlep: configure the boost
+
+On the OnePlus 8 Pro both TFA9874 (rev 0x0c74) speaker amplifiers were very
+quiet. Compared with the vendor driver and tuning file:
+
+- The NXP driver writes revision specific POR corrections (behind the key
+  registers) right after reset; the mainline driver accepted rev 0x0c74 but
+  never applied them. Apply them after the soft reset.
+- tfa987x_setup_dcdc() read its optional properties into uninitialised
+  variables, so with none in the device tree the boost was left disabled
+  (or configured from stack garbage). Initialise them to 0.
+- The TFA9874 second boost voltage was written to DCDC_CTRL0 using the
+  DCDC_CTRL6 mask; write it to DCDC_CTRL6.
+- Set LPM1MODE to 2 on TFA9874, as the vendor "speaker" profile does, so the
+  amplifier is not dropped into low power mode.
+- Describe the boost converter on the OnePlus 8 Pro with the values from the
+  vendor tfa98xx.cnt (max coil current 10, trip levels 10/5).
+
+Register values taken from the NXP tfa98xx driver (tfa_init_v6.c,
+tfa9874_specific) and the OnePlus 8 Pro tfa98xx.cnt.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/sound/soc/codecs/tfa987x.c	2026-11-02 14:23:32.039061487 +0000
++++ b/sound/soc/codecs/tfa987x.c	2026-11-02 14:24:10.826667902 +0000
+@@ -85,6 +85,10 @@
+ #define TFA9874_DCDC_CTRL6_DCVOF_MSK	GENMASK(8,  3)
+ #define TFA9874_DCDC_CTRL6_DCVOS_MSK	GENMASK(14,  9)
+ 
++#define TFA987X_KEY1			0x0f
++#define TFA987X_KEY2			0xa0
++#define TFA987X_KEY2_SRC		0xfb
++
+ static int tfa987x_digital_mute(struct snd_soc_dai *codec_dai, int mute, int stream)
+ {
+ 	struct snd_soc_component *component = codec_dai->component;
+@@ -145,7 +149,7 @@
+ 
+ static bool tfa987x_setup_dcdc(struct device *dev, struct regmap *rmap, u16 rev)
+ {
+-	u32 mcc, dcvof, dcvos, dctrip, dctrip2 = 0;
++	u32 mcc = 0, dcvof = 0, dcvos = 0, dctrip = 0, dctrip2 = 0;
+ 	int i;
+ 	u32 *dest[] = { &mcc, &dcvof, &dcvos, &dctrip, &dctrip2 };
+ 	const char *props[] = { "max-coil-current",
+@@ -191,7 +195,7 @@
+ 					FIELD_PREP(TFA9874_DCDC_CTRL6_DCVOF_MSK, dcvof));
+ 
+ 		if (dcvos)
+-			regmap_update_bits(rmap, TFA987X_DCDC_CTRL0,
++			regmap_update_bits(rmap, TFA987X_DCDC_CTRL6,
+ 					TFA9874_DCDC_CTRL6_DCVOS_MSK,
+ 					FIELD_PREP(TFA9874_DCDC_CTRL6_DCVOS_MSK, dcvos));
+ 		break;
+@@ -216,6 +220,42 @@
+ 	return true;
+ }
+ 
++struct tfa987x_reg_init {
++	u8 reg;
++	u16 val;
++};
++
++/* TFA9874 N1C POR corrections, generated code from the NXP tfa98xx driver */
++static const struct tfa987x_reg_init tfa9874_0c74_init[] = {
++	{ 0x02, 0x22c8 }, { 0x52, 0x57dc }, { 0x53, 0x003e }, { 0x56, 0x0400 },
++	{ 0x61, 0x0110 }, { 0x6f, 0x00a5 }, { 0x70, 0x07f8 }, { 0x73, 0x0047 },
++	{ 0x74, 0x5098 }, { 0x75, 0x8d28 }, { 0x80, 0x0000 }, { 0x83, 0x0799 },
++	{ 0x84, 0x0081 },
++};
++
++static void tfa987x_init_regs(struct regmap *rmap, u16 rev)
++{
++	const struct tfa987x_reg_init *regs;
++	unsigned int key, i, n;
++
++	switch (rev) {
++	case 0x0c74:
++		regs = tfa9874_0c74_init;
++		n = ARRAY_SIZE(tfa9874_0c74_init);
++		break;
++	default:
++		return;
++	}
++
++	/* Unlock the protected registers */
++	regmap_write(rmap, TFA987X_KEY1, 0x5a6b);
++	regmap_read(rmap, TFA987X_KEY2_SRC, &key);
++	regmap_write(rmap, TFA987X_KEY2, key ^ 0x005a);
++
++	for (i = 0; i < n; i++)
++		regmap_write(rmap, regs[i].reg, regs[i].val);
++}
++
+ static int tfa987x_i2c_probe(struct i2c_client *i2c)
+ {
+ 	struct device *dev = &i2c->dev;
+@@ -252,6 +292,9 @@
+ 	/* Perform soft reset */
+ 	regmap_write(rmap, TFA987X_SYS_CTRL0, TFA987X_SYS_CTRL0_I2CR_MSK);
+ 
++	/* Revision specific register corrections */
++	tfa987x_init_regs(rmap, rev);
++
+ 	/* Setup DC-DC Converter if we have configuration */
+ 	regmap_update_bits(rmap, TFA987X_SYS_CTRL0, TFA987X_SYS_CTRL0_DCDC_MSK,
+ 			   FIELD_PREP(TFA987X_SYS_CTRL0_DCDC_MSK,
+@@ -289,6 +332,11 @@
+ 		regmap_update_bits(rmap, TFA987X_MODE1_DET1,
+ 				 TFA987X_MODE1_DET1_LPM1MODE_MSK,
+ 				 FIELD_PREP(TFA987X_MODE1_DET1_LPM1MODE_MSK, 1));
++	/* Speaker (not receiver) use: keep the amplifier out of low power mode */
++	else if ((rev & 0xff) == 0x74)
++		regmap_update_bits(rmap, TFA987X_MODE1_DET1,
++				 TFA987X_MODE1_DET1_LPM1MODE_MSK,
++				 FIELD_PREP(TFA987X_MODE1_DET1_LPM1MODE_MSK, 2));
+ 
+ 	/* Turn on this thing */
+ 	regmap_update_bits(rmap, TFA987X_SYS_CTRL0,
+--- a/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts	2026-11-02 14:23:32.041061569 +0000
++++ b/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts	2026-11-02 14:24:19.047008321 +0000
+@@ -1144,6 +1144,11 @@
+ 		sound-channel = <0>;
+ 		sound-name-prefix = "Top Speaker";
+ 		#sound-dai-cells = <0>;
++
++		/* Boost converter, values from the vendor tfa98xx.cnt */
++		max-coil-current = <10>;
++		first-boost-trip-lvl = <10>;
++		second-boost-trip-lvl = <5>;
+ 	};
+ 
+ 	bottom_spkr: tfa9874@35 {
+@@ -1154,6 +1159,11 @@
+ 		sound-channel = <1>;
+ 		sound-name-prefix = "Bottom Speaker";
+ 		#sound-dai-cells = <0>;
++
++		/* Boost converter, values from the vendor tfa98xx.cnt */
++		max-coil-current = <10>;
++		first-boost-trip-lvl = <10>;
++		second-boost-trip-lvl = <5>;
+ 	};
+ };
+ 
