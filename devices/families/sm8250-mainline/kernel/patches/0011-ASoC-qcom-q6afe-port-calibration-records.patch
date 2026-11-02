@@ -1,0 +1,329 @@
+From: Zork130 <12914881+Zork130@users.noreply.github.com>
+Subject: [PATCH] ASoC: qcom: q6afe: send per-port calibration from firmware
+
+On Android the ACDB loader sends module parameters to an AFE port when it
+starts (afe_send_cal). Vendor modules such as NXP TFADSP get all of their
+configuration this way and stay idle without it.
+
+- q6afe: SET_PARAM_V3, which addresses module instances, and a list of
+  calibration records per port, sent after the topology on every start.
+- q6afe-dai: qcom,cal-firmware per DAI names a file of those records,
+  extracted from the vendor ACDB, loaded before the port first starts.
+
+OnePlus 8 Pro: TFADSP parameters for the speaker (TERTIARY_MI2S_RX) and its
+V/I feedback (TERTIARY_MI2S_TX).
+
+diff -ru a/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts b/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts
+--- a/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts	2026-11-02 16:44:00.875079089 +0000
++++ b/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts	2026-11-02 16:44:51.568172173 +0000
+@@ -1217,6 +1217,8 @@
+ 		reg = <TERTIARY_MI2S_RX>;
+ 		qcom,sd-lines = <1>;
+ 		qcom,topology = <0x1000b910>;
++		/* TFADSP parameters from the speaker ACDB (id 15) */
++		qcom,cal-firmware = "qcom/sm8250/OnePlus/instantnoodlep/afe-cal-speaker.bin";
+ 		/* Both amplifiers' current sense: 1, 2 top, 3, 4 bottom */
+ 		qcom,feedback-dai = <TERTIARY_MI2S_TX>;
+ 		qcom,feedback-channels = <1 2 3 4>;
+@@ -1226,6 +1228,7 @@
+ 		reg = <TERTIARY_MI2S_TX>;
+ 		qcom,sd-lines = <0>;
+ 		qcom,topology = <0x1000b909>;
++		qcom,cal-firmware = "qcom/sm8250/OnePlus/instantnoodlep/afe-cal-speaker-vi.bin";
+ 	};
+ 
+ 	dai@104 {
+diff -ru a/sound/soc/qcom/qdsp6/q6afe.c b/sound/soc/qcom/qdsp6/q6afe.c
+--- a/sound/soc/qcom/qdsp6/q6afe.c	2026-11-02 16:44:00.875079089 +0000
++++ b/sound/soc/qcom/qdsp6/q6afe.c	2026-11-02 16:44:23.508013624 +0000
+@@ -32,6 +32,9 @@
+ #define AFE_SVC_CMD_SET_PARAM		0x000100f3
+ #define AFE_PORT_CMDRSP_GET_PARAM_V2	0x00010106
+ #define AFE_PORT_CMD_GET_PARAM_V2	0x000100F0
++#define AFE_PORT_CMD_SET_PARAM_V3	0x000100FA
++#define Q6AFE_CAL_MAGIC			0x43464151	/* "QAFC" */
++#define Q6AFE_CAL_VERSION		1
+ #define AFE_PARAM_ID_SET_TOPOLOGY	0x0001025A
+ #define AFE_PARAM_ID_DEREGISTER_TOPOLOGY	0x000102E8
+ #define AFE_MODULE_FEEDBACK		0x00010257
+@@ -430,6 +433,38 @@
+ 	u32 mem_map_handle;
+ } __packed;
+ 
++struct afe_port_cmd_set_param_v3 {
++	u16 port_id;
++	u16 reserved;
++	u32 payload_address_lsw;
++	u32 payload_address_msw;
++	u32 mem_map_handle;
++	u32 payload_size;
++} __packed;
++
++struct afe_port_param_data_v3 {
++	u32 module_id;
++	u16 instance_id;
++	u16 reserved;
++	u32 param_id;
++	u32 param_size;
++} __packed;
++
++/* Calibration file, see q6afe_port_set_cal() */
++struct q6afe_cal_header {
++	__le32 magic;
++	__le32 version;
++	__le32 count;
++} __packed;
++
++struct q6afe_cal_record {
++	__le32 module_id;
++	__le32 instance_id;
++	__le32 param_id;
++	__le32 size;
++	u8 data[];
++} __packed;
++
+ struct afe_port_cmd_get_param_v2 {
+ 	u16 port_id;
+ 	u16 payload_size;
+@@ -686,6 +721,8 @@
+ 	struct kref refcount;
+ 	struct list_head node;
+ 	u32 topology;
++	const void *cal;
++	size_t cal_size;
+ 	void *get_buf;
+ 	size_t get_size;
+ };
+@@ -1026,6 +1063,7 @@
+ 		}
+ 		switch (res->opcode) {
+ 		case AFE_PORT_CMD_SET_PARAM_V2:
++		case AFE_PORT_CMD_SET_PARAM_V3:
+ 		case AFE_PORT_CMD_DEVICE_STOP:
+ 		case AFE_PORT_CMD_DEVICE_START:
+ 		case AFE_SVC_CMD_SET_PARAM:
+@@ -1197,6 +1235,79 @@
+ 			       psize, port->token);
+ }
+ 
++static int q6afe_port_set_param_v3(struct q6afe_port *port, u32 module_id,
++				   u16 instance_id, u32 param_id,
++				   const void *data, u32 psize)
++{
++	struct afe_port_cmd_set_param_v3 *param;
++	struct afe_port_param_data_v3 *pdata;
++	struct q6afe *afe = port->afe;
++	struct apr_pkt *pkt;
++	int ret, pkt_size = APR_HDR_SIZE + sizeof(*param) + sizeof(*pdata) +
++			    ALIGN(psize, 4);
++
++	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++
++	pkt = p;
++	param = p + APR_HDR_SIZE;
++	pdata = p + APR_HDR_SIZE + sizeof(*param);
++	memcpy(p + APR_HDR_SIZE + sizeof(*param) + sizeof(*pdata), data, psize);
++
++	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					   APR_HDR_LEN(APR_HDR_SIZE),
++					   APR_PKT_VER);
++	pkt->hdr.pkt_size = pkt_size;
++	pkt->hdr.token = port->token;
++	pkt->hdr.opcode = AFE_PORT_CMD_SET_PARAM_V3;
++
++	param->port_id = port->id;
++	param->payload_size = sizeof(*pdata) + ALIGN(psize, 4);
++	pdata->module_id = module_id;
++	pdata->instance_id = instance_id;
++	pdata->param_id = param_id;
++	pdata->param_size = ALIGN(psize, 4);
++
++	ret = afe_apr_send_pkt(afe, pkt, port, AFE_PORT_CMD_SET_PARAM_V3);
++	if (ret)
++		dev_err(afe->dev, "port 0x%x: set param 0x%x/0x%x/0x%x failed %d\n",
++			port->id, module_id, instance_id, param_id, ret);
++
++	return ret;
++}
++
++/* Send the calibration records set with q6afe_port_set_cal(). */
++static int q6afe_port_send_cal(struct q6afe_port *port)
++{
++	const struct q6afe_cal_header *hdr = port->cal;
++	const void *pos = hdr + 1, *end = port->cal + port->cal_size;
++	u32 i, count = le32_to_cpu(hdr->count);
++	int ret;
++
++	for (i = 0; i < count; i++) {
++		const struct q6afe_cal_record *rec = pos;
++		u32 size;
++
++		if (pos + sizeof(*rec) > end)
++			return -EINVAL;
++		size = le32_to_cpu(rec->size);
++		if (size > end - (pos + sizeof(*rec)))
++			return -EINVAL;
++
++		ret = q6afe_port_set_param_v3(port, le32_to_cpu(rec->module_id),
++					      le32_to_cpu(rec->instance_id),
++					      le32_to_cpu(rec->param_id),
++					      rec->data, size);
++		if (ret)
++			return ret;
++
++		pos += sizeof(*rec) + ALIGN(size, 4);
++	}
++
++	return 0;
++}
++
+ static int q6afe_port_set_param_v2(struct q6afe_port *port, void *data,
+ 				   int param_id, int module_id, int psize)
+ {
+@@ -1361,6 +1472,35 @@
+ EXPORT_SYMBOL_GPL(q6afe_port_set_feedback_path);
+ 
+ /**
++ * q6afe_port_set_cal() - Set the calibration a port is started with
++ *
++ * @port: AFE port
++ * @cal: calibration in the "QAFC" format: a struct q6afe_cal_header, then
++ *       its count of struct q6afe_cal_record, each with its data padded to
++ *       4 bytes. The caller keeps it allocated while the port exists.
++ * @size: size of @cal in bytes
++ *
++ * The records are sent as module parameters on each q6afe_port_start(),
++ * after the topology, as the vendor stacks send their ACDB data.
++ *
++ * Return: zero on success, -EINVAL if @cal is not a calibration file.
++ */
++int q6afe_port_set_cal(struct q6afe_port *port, const void *cal, size_t size)
++{
++	const struct q6afe_cal_header *hdr = cal;
++
++	if (size < sizeof(*hdr) || le32_to_cpu(hdr->magic) != Q6AFE_CAL_MAGIC ||
++	    le32_to_cpu(hdr->version) != Q6AFE_CAL_VERSION)
++		return -EINVAL;
++
++	port->cal = cal;
++	port->cal_size = size;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(q6afe_port_set_cal);
++
++/**
+  * q6afe_port_set_topology() - Select the topology a port starts with
+  *
+  * @port: AFE port
+@@ -1901,6 +2041,14 @@
+ 				port_id, port->topology);
+ 	}
+ 
++	if (port->cal) {
++		ret = q6afe_port_send_cal(port);
++		/* Not fatal either: modules run on their defaults. */
++		if (ret)
++			dev_err(afe->dev, "port 0x%x: calibration failed %d\n",
++				port_id, ret);
++	}
++
+ 	ret  = q6afe_port_set_param_v2(port, &port->port_cfg, param_id,
+ 				       AFE_MODULE_AUDIO_DEV_INTERFACE,
+ 				       sizeof(port->port_cfg));
+diff -ru a/sound/soc/qcom/qdsp6/q6afe-dai.c b/sound/soc/qcom/qdsp6/q6afe-dai.c
+--- a/sound/soc/qcom/qdsp6/q6afe-dai.c	2026-11-02 16:44:00.875079089 +0000
++++ b/sound/soc/qcom/qdsp6/q6afe-dai.c	2026-11-02 16:44:51.558171760 +0000
+@@ -9,6 +9,7 @@
+ #include <linux/device.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
++#include <linux/firmware.h>
+ #include <sound/pcm.h>
+ #include <sound/soc.h>
+ #include <sound/pcm_params.h>
+@@ -29,6 +30,9 @@
+ 	uint32_t data_delay;
+ 	uint32_t data_align;
+ 	uint32_t topology;
++	/* Module parameters sent at port start, see q6afe_port_set_cal() */
++	const char *cal_firmware;
++	bool cal_loaded;
+ 	/* Feedback (e.g. speaker V/I sense) TX port started with this RX port */
+ 	int feedback_dai;
+ 	uint32_t feedback_chans[Q6AFE_MAX_FEEDBACK_CHANNELS];
+@@ -66,6 +70,36 @@
+ 	dai_data->custom_topologies_registered = true;
+ }
+ 
++static void q6afe_dai_load_cal(struct device *dev,
++			       struct q6afe_dai_data *dai_data, int id)
++{
++	struct q6afe_dai_priv_data *priv = &dai_data->priv[id];
++	const struct firmware *fw;
++	void *cal;
++	int ret;
++
++	if (!priv->cal_firmware || priv->cal_loaded)
++		return;
++	/* Only try once: without it the modules run on their defaults. */
++	priv->cal_loaded = true;
++
++	ret = request_firmware(&fw, priv->cal_firmware, dev);
++	if (ret) {
++		dev_err(dev, "dai %d: no calibration %s (%d)\n", id,
++			priv->cal_firmware, ret);
++		return;
++	}
++
++	cal = devm_kmemdup(dev, fw->data, fw->size, GFP_KERNEL);
++	if (cal) {
++		ret = q6afe_port_set_cal(dai_data->port[id], cal, fw->size);
++		if (ret)
++			dev_err(dev, "dai %d: bad calibration %s\n", id,
++				priv->cal_firmware);
++	}
++	release_firmware(fw);
++}
++
+ /*
+  * Run the feedback TX port of an RX port, the way the vendor stacks do with
+  * a hostless capture: feedback path set, RX started, then TX started with
+@@ -111,6 +145,7 @@
+ 
+ 	*cfg = dai_data->port_config[rx_id].i2s_cfg;
+ 	cfg->sd_line_mask = dai_data->priv[tx_id].sd_line_mask;
++	q6afe_dai_load_cal(dev, dai_data, tx_id);
+ 
+ 	ret = q6afe_i2s_port_prepare(dai_data->port[tx_id], cfg);
+ 	if (!ret)
+@@ -546,6 +581,7 @@
+ 
+ 	if (dai_data->priv[dai->id].topology)
+ 		q6afe_dai_register_topologies(dai->dev, dai_data);
++	q6afe_dai_load_cal(dai->dev, dai_data, dai->id);
+ 
+ 	if (dai_data->priv[dai->id].feedback_dai >= 0)
+ 		q6afe_dai_feedback_set_path(dai->dev, dai_data, dai->id);
+@@ -1177,6 +1213,8 @@
+ 
+ 		priv = &data->priv[id];
+ 		of_property_read_u32(node, "qcom,topology", &priv->topology);
++		of_property_read_string(node, "qcom,cal-firmware",
++					&priv->cal_firmware);
+ 		if (!of_property_read_u32(node, "qcom,feedback-dai", &fb) &&
+ 		    fb < AFE_PORT_MAX && fb != id) {
+ 			ret = of_property_read_variable_u32_array(node,
+diff -ru a/sound/soc/qcom/qdsp6/q6afe.h b/sound/soc/qcom/qdsp6/q6afe.h
+--- a/sound/soc/qcom/qdsp6/q6afe.h	2026-11-02 16:44:00.875079089 +0000
++++ b/sound/soc/qcom/qdsp6/q6afe.h	2026-11-02 16:44:23.508013624 +0000
+@@ -253,6 +253,7 @@
+ int q6afe_port_get_module_param(struct q6afe_port *port, u32 module_id,
+ 				u32 param_id, void *data, size_t size);
+ void q6afe_port_set_topology(struct q6afe_port *port, u32 topology_id);
++int q6afe_port_set_cal(struct q6afe_port *port, const void *cal, size_t size);
+ int q6afe_port_set_feedback_path(struct q6afe_port *tx, struct q6afe_port *rx,
+ 				 const u32 *chan_info, int num_channels);
+ int q6afe_port_stop(struct q6afe_port *port);

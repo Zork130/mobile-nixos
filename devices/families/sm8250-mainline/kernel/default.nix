@@ -33,6 +33,12 @@ mobile-nixos.kernel-builder {
     ./patches/0008-ASoC-sm8250-oneplus-instantnoodlep-speaker-current-sense-feedback.patch
     # Tertiary MI2S (speakers) at 2 x 32 bit slots, for current sense resolution.
     ./patches/0009-ASoC-sm8250-tfa987x-32-bit-slots-on-tertiary-MI2S.patch
+    # q6afe-dai: TFADSP topologies + speaker feedback port set up from DT.
+    ./patches/0010-ASoC-qcom-q6afe-dai-topologies-and-feedback-port-from-DT.patch
+    # q6afe: per-port calibration records (TFADSP parameters from the ACDB).
+    ./patches/0011-ASoC-qcom-q6afe-port-calibration-records.patch
+    # tfa987x: calibrated Re25 from the amps' MTP to TFADSP on each start.
+    ./patches/0012-ASoC-tfa987x-send-calibrated-Re25-to-TFADSP.patch
   ];
 
   # drm/msm generates its register headers with python at build time.

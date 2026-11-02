@@ -1,0 +1,382 @@
+From: Zork130 <12914881+Zork130@users.noreply.github.com>
+Subject: [PATCH] ASoC: qcom: q6afe-dai: custom topologies and speaker
+ feedback port from DT
+
+Set up the DSP side of vendor speaker protection from the device tree:
+
+- qcom,custom-topologies on the q6afe DAI node: topology definitions,
+  registered with the DSP before the first port that uses one starts.
+- qcom,topology per DAI: the topology the port starts with. q6afe now
+  deregisters the previous one first, as a TX port won't take it twice.
+- qcom,feedback-dai and qcom,feedback-channels on an RX DAI: a TX port
+  carrying the amplifiers' V/I sense, started along with the RX port the
+  way the vendor stacks use a hostless capture: feedback path set, RX
+  started, then TX with the RX port's I2S format. Feedback failures are
+  logged but don't stop playback.
+
+OnePlus 8 Pro: NXP TFADSP topologies on TERTIARY_MI2S_RX/TX.
+
+diff -ru a/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts b/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts
+--- a/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts	2026-11-02 16:28:29.657521054 +0000
++++ b/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts	2026-11-02 16:29:53.909024405 +0000
+@@ -1204,14 +1204,28 @@
+ };
+ 
+ &q6afedai {
++	/*
++	 * NXP TFADSP speaker protection topologies, from the vendor
++	 * Global_cal.acdb: a count, then {version 2, topology, domains,
++	 * module count, {module, flags}...} records.
++	 */
++	qcom,custom-topologies = <2
++		2 0x1000b910 2 1 0x1000b911 0x10000
++		2 0x1000b909 2 1 0x1000b912 0x18000>;
++
+ 	dai@20 {
+ 		reg = <TERTIARY_MI2S_RX>;
+ 		qcom,sd-lines = <1>;
++		qcom,topology = <0x1000b910>;
++		/* Both amplifiers' current sense: 1, 2 top, 3, 4 bottom */
++		qcom,feedback-dai = <TERTIARY_MI2S_TX>;
++		qcom,feedback-channels = <1 2 3 4>;
+ 	};
+ 
+ 	dai@21 {
+ 		reg = <TERTIARY_MI2S_TX>;
+ 		qcom,sd-lines = <0>;
++		qcom,topology = <0x1000b909>;
+ 	};
+ 
+ 	dai@104 {
+diff -ru a/sound/soc/qcom/qdsp6/q6afe.c b/sound/soc/qcom/qdsp6/q6afe.c
+--- a/sound/soc/qcom/qdsp6/q6afe.c	2026-11-02 16:28:29.655520971 +0000
++++ b/sound/soc/qcom/qdsp6/q6afe.c	2026-11-02 16:28:51.621434835 +0000
+@@ -33,6 +33,11 @@
+ #define AFE_PORT_CMDRSP_GET_PARAM_V2	0x00010106
+ #define AFE_PORT_CMD_GET_PARAM_V2	0x000100F0
+ #define AFE_PARAM_ID_SET_TOPOLOGY	0x0001025A
++#define AFE_PARAM_ID_DEREGISTER_TOPOLOGY	0x000102E8
++#define AFE_MODULE_FEEDBACK		0x00010257
++#define AFE_PARAM_ID_FEEDBACK_PATH_CFG	0x0001022C
++#define AFE_API_VERSION_FEEDBACK_PATH	0x1
++#define AFE_FEEDBACK_MAX_CHANNELS	4
+ #define AFE_API_VERSION_TOPOLOGY_V1	0x1
+ #define AFE_PARAM_ID_HDMI_CONFIG	0x00010210
+ #define AFE_MODULE_AUDIO_DEV_INTERFACE	0x0001020C
+@@ -447,6 +452,13 @@
+ 	u32 topology_id;
+ } __packed;
+ 
++struct afe_param_id_feedback_path_cfg {
++	u32 minor_version;
++	s32 dst_portid;
++	s32 num_channels;
++	s32 chan_info[AFE_FEEDBACK_MAX_CHANNELS];
++} __packed;
++
+ struct afe_param_id_hdmi_multi_chan_audio_cfg {
+ 	u32 hdmi_cfg_minor_version;
+ 	u16 datatype;
+@@ -1315,6 +1327,40 @@
+ EXPORT_SYMBOL_GPL(q6afe_port_get_module_param);
+ 
+ /**
++ * q6afe_port_set_feedback_path() - Route a TX port's data to an RX port
++ *
++ * @tx: port carrying the feedback (e.g. speaker amplifier V/I sense)
++ * @rx: port whose processing (e.g. speaker protection) consumes it
++ * @chan_info: channel assignment, as used by the vendor stacks: 1, 2 for the
++ *             first speaker, 3, 4 for the second
++ * @num_channels: number of entries in @chan_info
++ *
++ * Must be set before the TX port is started.
++ *
++ * Return: zero on success, negative error code otherwise.
++ */
++int q6afe_port_set_feedback_path(struct q6afe_port *tx, struct q6afe_port *rx,
++				 const u32 *chan_info, int num_channels)
++{
++	struct afe_param_id_feedback_path_cfg cfg = {
++		.minor_version = AFE_API_VERSION_FEEDBACK_PATH,
++		.dst_portid = rx->id,
++		.num_channels = num_channels,
++	};
++	int i;
++
++	if (num_channels < 1 || num_channels > AFE_FEEDBACK_MAX_CHANNELS)
++		return -EINVAL;
++
++	for (i = 0; i < num_channels; i++)
++		cfg.chan_info[i] = chan_info[i];
++
++	return q6afe_port_set_param_v2(tx, &cfg, AFE_PARAM_ID_FEEDBACK_PATH_CFG,
++				       AFE_MODULE_FEEDBACK, sizeof(cfg));
++}
++EXPORT_SYMBOL_GPL(q6afe_port_set_feedback_path);
++
++/**
+  * q6afe_port_set_topology() - Select the topology a port starts with
+  *
+  * @port: AFE port
+@@ -1838,6 +1884,14 @@
+ 			.topology_id = port->topology,
+ 		};
+ 
++		/*
++		 * A topology that is still set from the last start can't be
++		 * set again; clear it first. Fails harmlessly if there is none.
++		 */
++		q6afe_port_set_param_v2(port, &topo,
++					AFE_PARAM_ID_DEREGISTER_TOPOLOGY,
++					AFE_MODULE_AUDIO_DEV_INTERFACE, 0);
++
+ 		/* Not fatal: the port still works with the default topology. */
+ 		if (q6afe_port_set_param_v2(port, &topo,
+ 					    AFE_PARAM_ID_SET_TOPOLOGY,
+diff -ru a/sound/soc/qcom/qdsp6/q6afe-dai.c b/sound/soc/qcom/qdsp6/q6afe-dai.c
+--- a/sound/soc/qcom/qdsp6/q6afe-dai.c	2026-11-02 16:28:29.656521013 +0000
++++ b/sound/soc/qcom/qdsp6/q6afe-dai.c	2026-11-02 16:29:53.901024073 +0000
+@@ -14,8 +14,11 @@
+ #include <sound/pcm_params.h>
+ #include "q6dsp-lpass-ports.h"
+ #include "q6dsp-common.h"
++#include "q6core.h"
+ #include "q6afe.h"
+ 
++#define Q6AFE_MAX_FEEDBACK_CHANNELS	4
++
+ 
+ struct q6afe_dai_priv_data {
+ 	uint32_t sd_line_mask;
+@@ -25,6 +28,11 @@
+ 	uint32_t invert_sync;
+ 	uint32_t data_delay;
+ 	uint32_t data_align;
++	uint32_t topology;
++	/* Feedback (e.g. speaker V/I sense) TX port started with this RX port */
++	int feedback_dai;
++	uint32_t feedback_chans[Q6AFE_MAX_FEEDBACK_CHANNELS];
++	int num_feedback_chans;
+ };
+ 
+ struct q6afe_dai_data {
+@@ -32,8 +40,102 @@
+ 	struct q6afe_port_config port_config[AFE_PORT_MAX];
+ 	bool is_port_started[AFE_PORT_MAX];
+ 	struct q6afe_dai_priv_data priv[AFE_PORT_MAX];
++	u32 *custom_topologies;
++	int custom_topologies_size;
++	bool custom_topologies_registered;
+ };
+ 
++/*
++ * Custom topologies from the vendor ACDB, registered with the DSP before
++ * the first port that uses one starts.
++ */
++static void q6afe_dai_register_topologies(struct device *dev,
++					  struct q6afe_dai_data *dai_data)
++{
++	int ret;
++
++	if (!dai_data->custom_topologies || dai_data->custom_topologies_registered)
++		return;
++
++	ret = q6core_register_topologies(dai_data->custom_topologies,
++					 dai_data->custom_topologies_size);
++	if (ret) {
++		dev_err(dev, "failed to register custom topologies (%d)\n", ret);
++		return;
++	}
++	dai_data->custom_topologies_registered = true;
++}
++
++/*
++ * Run the feedback TX port of an RX port, the way the vendor stacks do with
++ * a hostless capture: feedback path set, RX started, then TX started with
++ * the RX port's I2S format. Failures only cost the feedback, never playback.
++ */
++static void q6afe_dai_feedback_set_path(struct device *dev,
++					struct q6afe_dai_data *dai_data, int rx_id)
++{
++	struct q6afe_dai_priv_data *rx_priv = &dai_data->priv[rx_id];
++	int tx_id = rx_priv->feedback_dai;
++	struct q6afe_port *tx;
++	int ret;
++
++	if (!dai_data->port[tx_id]) {
++		tx = q6afe_port_get_from_id(dev, tx_id);
++		if (IS_ERR(tx)) {
++			dev_err(dev, "no feedback port %d\n", tx_id);
++			rx_priv->feedback_dai = -1;
++			return;
++		}
++		dai_data->port[tx_id] = tx;
++		q6afe_port_set_topology(tx, dai_data->priv[tx_id].topology);
++	}
++
++	ret = q6afe_port_set_feedback_path(dai_data->port[tx_id],
++					   dai_data->port[rx_id],
++					   rx_priv->feedback_chans,
++					   rx_priv->num_feedback_chans);
++	if (ret)
++		dev_err(dev, "failed to set feedback path %d -> %d (%d)\n",
++			tx_id, rx_id, ret);
++}
++
++static void q6afe_dai_feedback_start(struct device *dev,
++				     struct q6afe_dai_data *dai_data, int rx_id)
++{
++	int tx_id = dai_data->priv[rx_id].feedback_dai;
++	struct q6afe_i2s_cfg *cfg = &dai_data->port_config[tx_id].i2s_cfg;
++	int ret;
++
++	if (dai_data->is_port_started[tx_id])
++		return;
++
++	*cfg = dai_data->port_config[rx_id].i2s_cfg;
++	cfg->sd_line_mask = dai_data->priv[tx_id].sd_line_mask;
++
++	ret = q6afe_i2s_port_prepare(dai_data->port[tx_id], cfg);
++	if (!ret)
++		ret = q6afe_port_start(dai_data->port[tx_id]);
++	if (ret) {
++		dev_err(dev, "failed to start feedback port %d (%d)\n",
++			tx_id, ret);
++		return;
++	}
++	dai_data->is_port_started[tx_id] = true;
++}
++
++static void q6afe_dai_feedback_stop(struct device *dev,
++				    struct q6afe_dai_data *dai_data, int rx_id)
++{
++	int tx_id = dai_data->priv[rx_id].feedback_dai;
++
++	if (!dai_data->is_port_started[tx_id])
++		return;
++
++	if (q6afe_port_stop(dai_data->port[tx_id]) < 0)
++		dev_err(dev, "fail to close feedback port %d\n", tx_id);
++	dai_data->is_port_started[tx_id] = false;
++}
++
+ static int q6slim_hw_params(struct snd_pcm_substream *substream,
+ 			    struct snd_pcm_hw_params *params,
+ 			    struct snd_soc_dai *dai)
+@@ -376,6 +478,9 @@
+ 	if (!dai_data->is_port_started[dai->id])
+ 		return;
+ 
++	if (dai_data->priv[dai->id].feedback_dai >= 0)
++		q6afe_dai_feedback_stop(dai->dev, dai_data, dai->id);
++
+ 	rc = q6afe_port_stop(dai_data->port[dai->id]);
+ 	if (rc < 0)
+ 		dev_err(dai->dev, "fail to close AFE port (%d)\n", rc);
+@@ -391,6 +496,9 @@
+ 	int rc;
+ 
+ 	if (dai_data->is_port_started[dai->id]) {
++		if (dai_data->priv[dai->id].feedback_dai >= 0)
++			q6afe_dai_feedback_stop(dai->dev, dai_data, dai->id);
++
+ 		/* stop the port and restart with new port config */
+ 		rc = q6afe_port_stop(dai_data->port[dai->id]);
+ 		if (rc < 0) {
+@@ -436,6 +544,12 @@
+ 		return -EINVAL;
+ 	}
+ 
++	if (dai_data->priv[dai->id].topology)
++		q6afe_dai_register_topologies(dai->dev, dai_data);
++
++	if (dai_data->priv[dai->id].feedback_dai >= 0)
++		q6afe_dai_feedback_set_path(dai->dev, dai_data, dai->id);
++
+ 	rc = q6afe_port_start(dai_data->port[dai->id]);
+ 	if (rc < 0) {
+ 		dev_err(dai->dev, "fail to start AFE port %x\n", dai->id);
+@@ -443,6 +557,9 @@
+ 	}
+ 	dai_data->is_port_started[dai->id] = true;
+ 
++	if (dai_data->priv[dai->id].feedback_dai >= 0)
++		q6afe_dai_feedback_start(dai->dev, dai_data, dai->id);
++
+ 	return 0;
+ }
+ 
+@@ -678,6 +795,7 @@
+ 		return -EINVAL;
+ 	}
+ 	dai_data->port[dai->id] = port;
++	q6afe_port_set_topology(port, dai_data->priv[dai->id].topology);
+ 
+ 	return 0;
+ }
+@@ -1027,12 +1145,29 @@
+ 				    struct q6afe_dai_data *data)
+ {
+ 	struct device_node *node;
+-	int ret;
++	int ret, n;
++
++	for (n = 0; n < AFE_PORT_MAX; n++)
++		data->priv[n].feedback_dai = -1;
++
++	ret = of_property_count_u32_elems(dev->of_node, "qcom,custom-topologies");
++	if (ret > 0) {
++		data->custom_topologies = devm_kcalloc(dev, ret, sizeof(u32),
++						       GFP_KERNEL);
++		if (data->custom_topologies &&
++		    !of_property_read_u32_array(dev->of_node,
++						"qcom,custom-topologies",
++						data->custom_topologies, ret))
++			data->custom_topologies_size = ret * sizeof(u32);
++		else
++			data->custom_topologies = NULL;
++	}
+ 
+ 	for_each_child_of_node(dev->of_node, node) {
+ 		unsigned int lines[Q6AFE_MAX_MI2S_LINES];
+ 		struct q6afe_dai_priv_data *priv;
+ 		int id, i, num_lines;
++		u32 fb;
+ 
+ 		ret = of_property_read_u32(node, "reg", &id);
+ 		if (ret || id < 0 || id >= AFE_PORT_MAX) {
+@@ -1040,6 +1175,22 @@
+ 			continue;
+ 		}
+ 
++		priv = &data->priv[id];
++		of_property_read_u32(node, "qcom,topology", &priv->topology);
++		if (!of_property_read_u32(node, "qcom,feedback-dai", &fb) &&
++		    fb < AFE_PORT_MAX && fb != id) {
++			ret = of_property_read_variable_u32_array(node,
++					"qcom,feedback-channels",
++					priv->feedback_chans, 1,
++					Q6AFE_MAX_FEEDBACK_CHANNELS);
++			if (ret > 0) {
++				priv->feedback_dai = fb;
++				priv->num_feedback_chans = ret;
++			} else {
++				dev_err(dev, "dai %d: bad qcom,feedback-channels\n", id);
++			}
++		}
++
+ 		switch (id) {
+ 		/* MI2S specific properties */
+ 		case SENARY_MI2S_RX ... SENARY_MI2S_TX:
+diff -ru a/sound/soc/qcom/qdsp6/q6afe.h b/sound/soc/qcom/qdsp6/q6afe.h
+--- a/sound/soc/qcom/qdsp6/q6afe.h	2026-11-02 16:28:29.656521013 +0000
++++ b/sound/soc/qcom/qdsp6/q6afe.h	2026-11-02 16:28:45.181166933 +0000
+@@ -253,6 +253,8 @@
+ int q6afe_port_get_module_param(struct q6afe_port *port, u32 module_id,
+ 				u32 param_id, void *data, size_t size);
+ void q6afe_port_set_topology(struct q6afe_port *port, u32 topology_id);
++int q6afe_port_set_feedback_path(struct q6afe_port *tx, struct q6afe_port *rx,
++				 const u32 *chan_info, int num_channels);
+ int q6afe_port_stop(struct q6afe_port *port);
+ void q6afe_port_put(struct q6afe_port *port);
+ int q6afe_get_port_id(int index);

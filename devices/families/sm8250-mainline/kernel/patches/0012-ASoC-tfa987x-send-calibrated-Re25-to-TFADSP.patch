@@ -1,0 +1,209 @@
+From: Zork130 <12914881+Zork130@users.noreply.github.com>
+Subject: [PATCH] ASoC: tfa987x: send the calibrated speaker resistance to
+ TFADSP on the ADSP
+
+With NXP TFADSP speaker protection running on a Qualcomm ADSP, the
+algorithm needs each speaker's resistance at 25 C, measured at calibration
+and stored in the amplifier's MTP. The ACDB parameters sent at port start
+only carry a default; a too high value makes the algorithm think the coil
+is colder than it is.
+
+With nxp,tfadsp, read R25C from MTP at probe (if MTPEX says calibrated)
+and send SetRe25C for the stereo pair to the TFADSP RX module on each
+playback prepare, through a new q6afe_dai_set_module_param() on the CPU
+DAI, after its port and calibration are up.
+
+diff -ruN a/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts b/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts
+--- a/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts	2026-11-02 16:54:18.476642435 +0000
++++ b/arch/arm64/boot/dts/qcom/sm8250-oneplus-instantnoodlep.dts	2026-11-02 16:54:49.603959573 +0000
+@@ -1143,6 +1143,7 @@
+ 		vddd-supply = <&vreg_s4a_1p8>;
+ 		sound-channel = <0>;
+ 		sound-name-prefix = "Top Speaker";
++		nxp,tfadsp;
+ 		#sound-dai-cells = <0>;
+ 
+ 		/* Boost converter, values from the vendor tfa98xx.cnt */
+@@ -1158,6 +1159,7 @@
+ 		vddd-supply = <&vreg_s4a_1p8>;
+ 		sound-channel = <1>;
+ 		sound-name-prefix = "Bottom Speaker";
++		nxp,tfadsp;
+ 		#sound-dai-cells = <0>;
+ 
+ 		/* Boost converter, values from the vendor tfa98xx.cnt */
+diff -ruN a/include/sound/q6afe-dai.h b/include/sound/q6afe-dai.h
+--- a/include/sound/q6afe-dai.h	1970-01-01 01:00:00.000000000 +0100
++++ b/include/sound/q6afe-dai.h	2026-11-02 16:54:49.583958727 +0000
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef __SOUND_Q6AFE_DAI_H__
++#define __SOUND_Q6AFE_DAI_H__
++
++#include <linux/kconfig.h>
++#include <linux/types.h>
++
++struct snd_soc_dai;
++
++#if IS_REACHABLE(CONFIG_SND_SOC_QDSP6_AFE_DAI)
++int q6afe_dai_set_module_param(struct snd_soc_dai *dai, u32 module_id,
++			       u32 param_id, const void *data, size_t size);
++#else
++static inline int q6afe_dai_set_module_param(struct snd_soc_dai *dai,
++					     u32 module_id, u32 param_id,
++					     const void *data, size_t size)
++{
++	return -ENODEV;
++}
++#endif
++
++#endif /* __SOUND_Q6AFE_DAI_H__ */
+diff -ruN a/sound/soc/codecs/tfa987x.c b/sound/soc/codecs/tfa987x.c
+--- a/sound/soc/codecs/tfa987x.c	2026-11-02 16:54:18.475642392 +0000
++++ b/sound/soc/codecs/tfa987x.c	2026-11-02 16:55:05.211619343 +0000
+@@ -9,7 +9,9 @@
+ #include <linux/i2c.h>
+ #include <linux/module.h>
+ #include <linux/regmap.h>
++#include <linux/unaligned.h>
+ #include <sound/soc.h>
++#include <sound/q6afe-dai.h>
+ 
+ #define TFA987X_SYS_CTRL0		0x00
+ #define TFA987X_SYS_CTRL0_PWDN_MSK	BIT(0)
+@@ -92,6 +94,54 @@
+ #define TFA987X_KEY2			0xa0
+ #define TFA987X_KEY2_SRC		0xfb
+ 
++#define TFA987X_MTP0			0xf0
++#define TFA987X_MTP0_MTPEX_MSK		BIT(1)
++#define TFA987X_R25C			0xf5
++
++/*
++ * NXP TFADSP speaker protection on a Qualcomm ADSP: the stereo pair's
++ * calibrated speaker resistance at 25 C, from the amplifiers' MTP, sent
++ * to the algorithm on every start (the ACDB parameters carry a default).
++ */
++#define TFADSP_MODULE_RX		0x1000b911
++#define TFADSP_PARAM_RX_CFG		0x1000b921
++#define TFADSP_MSG_SET_RE25C		0x008105	/* speakerboost 0x05 */
++
++static struct {
++	bool enabled;
++	u32 re25_mohm[2];
++} tfa987x_tfadsp;
++
++static int tfa987x_tfadsp_prepare(struct snd_pcm_substream *substream,
++				  struct snd_soc_dai *dai)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	u8 msg[12] = {};
++	int i, ret;
++
++	if (!tfa987x_tfadsp.enabled || substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
++		return 0;
++
++	/* Without calibration the algorithm keeps the ACDB default. */
++	for (i = 0; i < 2; i++)
++		if (!tfa987x_tfadsp.re25_mohm[i])
++			return 0;
++
++	/* 24 bit big endian words: command id, then ohm in Q16 per speaker */
++	put_unaligned_be24(TFADSP_MSG_SET_RE25C, &msg[0]);
++	for (i = 0; i < 2; i++)
++		put_unaligned_be24((u64)tfa987x_tfadsp.re25_mohm[i] * 65536 / 1000,
++				   &msg[3 + 3 * i]);
++
++	ret = q6afe_dai_set_module_param(snd_soc_rtd_to_cpu(rtd, 0),
++					 TFADSP_MODULE_RX, TFADSP_PARAM_RX_CFG,
++					 msg, sizeof(msg));
++	if (ret)
++		dev_err(dai->dev, "failed to send speaker calibration: %d\n", ret);
++
++	return 0;
++}
++
+ static int tfa987x_digital_mute(struct snd_soc_dai *codec_dai, int mute, int stream)
+ {
+ 	struct snd_soc_component *component = codec_dai->component;
+@@ -128,6 +178,7 @@
+ 
+ static const struct snd_soc_dai_ops tfa987x_dai_ops = {
+ 	.mute_stream = tfa987x_digital_mute,
++	.prepare = tfa987x_tfadsp_prepare,
+ };
+ 
+ static struct snd_soc_dai_driver tfa987x_dai = {
+@@ -304,6 +355,20 @@
+ 
+ 	of_property_read_u32(dev->of_node, "sound-channel", &channel_index);
+ 
++	if (of_property_read_bool(dev->of_node, "nxp,tfadsp") && channel_index < 2) {
++		unsigned int mtp, re25;
++
++		tfa987x_tfadsp.enabled = true;
++		if (!regmap_read(rmap, TFA987X_MTP0, &mtp) &&
++		    (mtp & TFA987X_MTP0_MTPEX_MSK) &&
++		    !regmap_read(rmap, TFA987X_R25C, &re25) && re25) {
++			tfa987x_tfadsp.re25_mohm[channel_index] = re25;
++			dev_info(dev, "calibrated speaker: %u mOhm\n", re25);
++		} else {
++			dev_warn(dev, "speaker not calibrated\n");
++		}
++	}
++
+ 	/* Perform soft reset */
+ 	regmap_write(rmap, TFA987X_SYS_CTRL0, TFA987X_SYS_CTRL0_I2CR_MSK);
+ 
+diff -ruN a/sound/soc/qcom/qdsp6/q6afe-dai.c b/sound/soc/qcom/qdsp6/q6afe-dai.c
+--- a/sound/soc/qcom/qdsp6/q6afe-dai.c	2026-11-02 16:54:18.475642392 +0000
++++ b/sound/soc/qcom/qdsp6/q6afe-dai.c	2026-11-02 16:54:49.603959573 +0000
+@@ -13,6 +13,7 @@
+ #include <sound/pcm.h>
+ #include <sound/soc.h>
+ #include <sound/pcm_params.h>
++#include <sound/q6afe-dai.h>
+ #include "q6dsp-lpass-ports.h"
+ #include "q6dsp-common.h"
+ #include "q6core.h"
+@@ -820,6 +821,39 @@
+ 	{"USB Playback", NULL, "USB_RX"},
+ };
+ 
++static const struct snd_soc_component_driver q6afe_dai_component;
++
++/**
++ * q6afe_dai_set_module_param() - Set a module parameter on a running port
++ *
++ * @dai: q6afe DAI, e.g. the CPU DAI of a codec's DAI link
++ * @module_id: module in the port's topology
++ * @param_id: parameter of that module
++ * @data: parameter payload
++ * @size: payload size in bytes
++ *
++ * For codec drivers whose DSP side algorithm needs data only they have, such
++ * as amplifier calibration for speaker protection.
++ *
++ * Return: zero on success, negative error code otherwise.
++ */
++int q6afe_dai_set_module_param(struct snd_soc_dai *dai, u32 module_id,
++			       u32 param_id, const void *data, size_t size)
++{
++	struct q6afe_dai_data *dai_data;
++
++	if (dai->component->driver != &q6afe_dai_component)
++		return -EINVAL;
++
++	dai_data = dev_get_drvdata(dai->dev);
++	if (!dai_data->is_port_started[dai->id])
++		return -EAGAIN;
++
++	return q6afe_port_set_module_param(dai_data->port[dai->id], module_id,
++					   param_id, data, size);
++}
++EXPORT_SYMBOL_GPL(q6afe_dai_set_module_param);
++
+ static int msm_dai_q6_dai_probe(struct snd_soc_dai *dai)
+ {
+ 	struct q6afe_dai_data *dai_data = dev_get_drvdata(dai->dev);
