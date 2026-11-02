@@ -22,6 +22,16 @@ in
         **CURRENT CONFIGURATION ALSO OPENS ACCESS TO ALL WITHOUT A PASSWORD NOR SSH KEY.**
       '';
     };
+    port = mkOption {
+      type = types.port;
+      default = 22;
+      description = ''
+        Port for the stage-1 ssh daemon.
+
+        The daemon keeps running after switch-root, so use a port that
+        does not clash with the stage-2 ssh daemon.
+      '';
+    };
   };
 
   config.mobile.boot.stage-1 = lib.mkIf cfg.enable {
@@ -50,7 +60,7 @@ in
             FileUtils.mkdir_p("/etc/dropbear")
             # THIS IS HIGHLY INSECURE
             # This allows blank login passwords.
-            System.spawn("dropbear", "-ERB", "-b", "/etc/banner")
+            System.spawn("dropbear", "-ERB", "-b", "/etc/banner", "-p", "${toString cfg.port}")
           end
         end
       '')
