@@ -178,7 +178,9 @@ in
 
 let
   evaluatedStructuredConfig = import ./eval-config.nix {
-    inherit lib path version writeShellScript;
+    inherit lib path version;
+    # Runs during the build, so it must target the build platform when cross-compiling.
+    inherit (buildPackages) writeShellScript;
     structuredConfig = (systemBuild-structuredConfig version);
   };
 
@@ -232,6 +234,8 @@ stdenv.mkDerivation (inputArgs // {
     ++ optional  (lib.versionAtLeast version "5.2")  cpio
     ++ optional  (lib.versionAtLeast version "5.8")  elfutils
     ++ optional  (isCompressed == "lz4") lz4
+    # Newer kernels no longer set DEPMOD in the Makefile; scripts/depmod.sh looks it up in PATH.
+    ++ optional  isModular buildPackages.kmod
     # Mobile NixOS inputs.
     # While some kernels might not need those, most will.
     ++ [ dtc ]
